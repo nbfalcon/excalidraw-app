@@ -2,6 +2,7 @@ import base64
 import functools
 import json
 import os.path
+import re
 import sys
 import types
 from enum import IntEnum
@@ -30,11 +31,11 @@ class g_async:
             fst, *components = item.split('_')
             total = fst
             for comp in components:
-                new_finish = getattr(self.wrappee, total + '_finish')
+                new_finish = getattr(self.wrappee, total + '_finish', None)
                 if new_finish is not None:
                     finish = new_finish
                 # We don't care about the complete item, since that does not exist
-                total += comp
+                total += "_" + comp
 
         @types.coroutine
         def async_fn(*args, **kwargs):
@@ -93,16 +94,29 @@ def _debug_print(*args):
         print(*args)
 
 
+def _file_filter(chooser: Gtk.FileChooser, name: str, pattern: str):
+    chooser_filter = Gtk.FileFilter()
+    chooser_filter.set_name(name)
+    chooser_filter.add_pattern(pattern)
+    chooser.add_filter(chooser_filter)
+
+
+def _remove_suffix_regex(base: str, suffix: str):
+    if match := re.search(suffix, base):
+        base = base[:match.start(0)]
+    return base
+
+
 class ExcalidrawSaveFormat(IntEnum):
     JSON = 0
-    HYBRID_SVG = 1
-    HYBRID_PNG = 2
+    SVG = 1
+    PNG = 2
 
     def to_js_name(self):
         return {
             ExcalidrawSaveFormat.JSON: "json",
-            ExcalidrawSaveFormat.HYBRID_SVG: "svg",
-            ExcalidrawSaveFormat.HYBRID_PNG: "png"
+            ExcalidrawSaveFormat.SVG: "svg",
+            ExcalidrawSaveFormat.PNG: "png"
         }[self]
 
 
@@ -127,19 +141,23 @@ class ExcalidrawWindow:
         accels = Gtk.AccelGroup()
         # noinspection PyTypeChecker
         accels.connect(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK, Gtk.AccelFlags(0),
-                       _g_async_run_cb(self._save_as))
+                       _g_async_run_cb(self._action_save_as))
         # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._save))
+        accels.connect(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._action_save))
         # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._open))
+        accels.connect(Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._action_open))
         # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), self._print)
+        accels.connect(Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), self._action_print)
+        # noinspection PyTypeChecker
+        accels.connect(Gdk.KEY_e, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0),
+                       _g_async_run_cb(self._action_export))
         window.add_accel_group(accels)
 
         self._save_location = None
         self._save_running = BooleanLock(False)
         if open_initially is not None:
             self._open_file(Gio.File.new_for_commandline_arg(open_initially))
+        self._export_last: Optional[Gio.File] = None
 
         self.close_on_save = close_on_save
 
@@ -154,22 +172,21 @@ class ExcalidrawWindow:
 
     # FIXME: export dialog
     # FIXME: debounce
-    async def get_save_data(self, save_format: ExcalidrawSaveFormat):
+    async def get_save_data(self, save_format: ExcalidrawSaveFormat, for_export: bool = False):
         def cb(resolve):
             # This hack is necessary because unlike in Apple's WebKit, there is no way to run an async javascript
             # function. Our only option is to abuse signal handlers (though this only works if the function
             # finishes quickly enough).
             used_nonce = self._get_save_data_nonce
             self._get_save_data_cbs[used_nonce] = resolve
-            args = {'format': save_format.to_js_name(), 'export': False}
+            args = {'format': save_format.to_js_name(), 'export': for_export}
             self.webview.run_javascript(
                 f"""
                 getSaveData({json.dumps(args)}).then(result => 
                     window.webkit.messageHandlers.getSaveData.postMessage(
                         {{data: result, nonce: {used_nonce}}}))
                 """)
-            # Just for theoretical correctness, ensure we are not losing precision on JS side
-            self._get_save_data_nonce = (self._get_save_data_nonce + 1) % 1_000_000
+            self._get_save_data_nonce += 1
 
         result = await g_async.promise(cb)
         _debug_print("get_save_data:", result)
@@ -179,18 +196,18 @@ class ExcalidrawWindow:
         if self._save_location is not None:
             uri = self._save_location.get_uri()
             if uri.endswith(".excalidraw.svg"):
-                return ExcalidrawSaveFormat.HYBRID_SVG
+                return ExcalidrawSaveFormat.SVG
             elif uri.endswith(".excalidraw.png"):
-                return ExcalidrawSaveFormat.HYBRID_PNG
+                return ExcalidrawSaveFormat.PNG
         return ExcalidrawSaveFormat.JSON
 
     def _load_from(self, data: bytes, save_format: ExcalidrawSaveFormat):
         args = {'format': save_format.to_js_name()}
         if save_format == ExcalidrawSaveFormat.JSON:
             args['data'] = json.loads(data)
-        elif save_format == ExcalidrawSaveFormat.HYBRID_SVG:
+        elif save_format == ExcalidrawSaveFormat.SVG:
             args['blob'] = data.decode('utf-8')
-        elif save_format == ExcalidrawSaveFormat.HYBRID_PNG:
+        elif save_format == ExcalidrawSaveFormat.PNG:
             args['base64'] = base64.b64encode(data)
         _debug_print("_load_from:", args)
         self.webview.run_javascript(f"""
@@ -200,13 +217,14 @@ class ExcalidrawWindow:
         }})({json.dumps(args)});
         """)
 
-    async def _export_to(self, save_format: ExcalidrawSaveFormat):
+    async def _export_to(self, save_format: ExcalidrawSaveFormat, for_export: bool = False):
+        save_data = await self.get_save_data(save_format, for_export=for_export)
         if save_format == ExcalidrawSaveFormat.JSON:
-            return json.dumps(await self.get_save_data(ExcalidrawSaveFormat.JSON)).encode('utf-8')
-        elif save_format == ExcalidrawSaveFormat.HYBRID_SVG:
-            return (await self.get_save_data(ExcalidrawSaveFormat.HYBRID_SVG))['blob'].encode('utf-8')
-        elif save_format == ExcalidrawSaveFormat.HYBRID_PNG:
-            return base64.b64decode((await self.get_save_data(ExcalidrawSaveFormat.HYBRID_PNG))['base64'])
+            return json.dumps(save_data).encode('utf-8')
+        elif save_format == ExcalidrawSaveFormat.SVG:
+            return save_data['blob'].encode('utf-8')
+        elif save_format == ExcalidrawSaveFormat.PNG:
+            return base64.b64decode(save_data['base64'])
 
     async def _perform_save(self):
         if self._save_running.locked:
@@ -218,9 +236,9 @@ class ExcalidrawWindow:
             buffer = await self._export_to(self._get_save_format())
             await g_async(stream).write_async(buffer, GLib.PRIORITY_DEFAULT)
 
-    async def _save(self):
+    async def _action_save(self):
         if self._save_location is None:
-            await self._save_as()
+            await self._action_save_as()
         else:
             await self._perform_save()
             if self.close_on_save:
@@ -232,18 +250,9 @@ class ExcalidrawWindow:
         chooser.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, ok, Gtk.ResponseType.OK)
 
         # Using SVG is most convenient, so put it at the top
-        svg_filter = Gtk.FileFilter()
-        svg_filter.set_name("Excalidraw SVG")
-        svg_filter.add_pattern("*.excalidraw.svg")
-        chooser.add_filter(svg_filter)
-        png_filter = Gtk.FileFilter()
-        png_filter.set_name("Excalidraw PNG")
-        png_filter.add_pattern("*.excalidraw.png")
-        chooser.add_filter(png_filter)
-        json_filter = Gtk.FileFilter()
-        json_filter.set_name("Excalidraw JSON")
-        json_filter.add_pattern("*.excalidraw")
-        chooser.add_filter(json_filter)
+        _file_filter(chooser, "Excalidraw SVG", "*.excalidraw.svg")
+        _file_filter(chooser, "Excalidraw PNG", "*.excalidraw.png")
+        _file_filter(chooser, "Excalidraw JSON", "*.excalidraw")
 
         if self._save_location is not None:
             chooser.set_uri(self._save_location.get_uri())
@@ -262,7 +271,7 @@ class ExcalidrawWindow:
                 self._save_running = BooleanLock(False)
         self._save_location = new_file
 
-    async def _save_as(self):
+    async def _action_save_as(self):
         chooser = self._make_file_chooser(Gtk.FileChooserAction.SAVE, Gtk.STOCK_SAVE_AS)
 
         if chooser.run() == Gtk.ResponseType.OK:
@@ -271,13 +280,13 @@ class ExcalidrawWindow:
             self.close_on_save = False
         chooser.destroy()
 
-    async def _open(self):
+    async def _action_open(self):
         chooser = self._make_file_chooser(Gtk.FileChooserAction.OPEN, Gtk.STOCK_OPEN)
         if chooser.run() == Gtk.ResponseType.OK:
             await self._open_file(chooser.get_file())
         chooser.destroy()
 
-    def _print(self, *_):
+    def _action_print(self, *_):
         print_op = WebKit2.PrintOperation(web_view=self.webview)
         print_op.run_dialog(self.window)
 
@@ -289,6 +298,32 @@ class ExcalidrawWindow:
                 self._load_from(content, self._get_save_format())
         except GLib.Error as e:
             print(f"Failed to open '{self._save_location.get_uri()}': {e}", file=sys.stderr)
+
+    async def _action_export(self):
+        chooser = Gtk.FileChooserDialog(action=Gtk.FileChooserAction.SAVE)
+        chooser.set_do_overwrite_confirmation(True)
+        chooser.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_SAVE_AS, Gtk.ResponseType.OK)
+        _file_filter(chooser, "svg", "*.svg")
+        _file_filter(chooser, "png", "*.png")
+        if self._export_last is not None:
+            chooser.set_uri(self._export_last.get_uri())
+        elif self._save_location is not None:
+            name = _remove_suffix_regex(self._save_location.get_uri(), r"(\.excalidraw)?(\.(svg|png))?$")
+            name = name or "output"
+            chooser.set_uri(name + ".svg")
+        else:
+            chooser.set_current_name("output.svg")
+
+        if chooser.run() == Gtk.ResponseType.OK:
+            file: Gio.File = chooser.get_file()
+            self._export_last = file
+            save_format = ExcalidrawSaveFormat.PNG if file.get_uri().endswith(".png") else ExcalidrawSaveFormat.SVG
+            content = await self._export_to(save_format, for_export=True)
+            _debug_print('export', content)
+            # Use .new to supress PyCharm warning
+            await g_async(file).replace_contents_bytes_async(GLib.Bytes.new(content), None, False,
+                                                             Gio.FileCreateFlags.NONE)
+        chooser.destroy()
 
     def show(self):
         self.window.show()
