@@ -138,20 +138,15 @@ class ExcalidrawWindow:
         window.add(webview)
         webview.show()
 
-        accels = Gtk.AccelGroup()
-        # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK, Gtk.AccelFlags(0),
-                       _g_async_run_cb(self._action_save_as))
-        # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._action_save))
-        # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), _g_async_run_cb(self._action_open))
-        # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0), self._action_print)
-        # noinspection PyTypeChecker
-        accels.connect(Gdk.KEY_e, Gdk.ModifierType.CONTROL_MASK, Gtk.AccelFlags(0),
-                       _g_async_run_cb(self._action_export))
-        window.add_accel_group(accels)
+        self._KEYBINDINGS = {
+            (Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_save),
+            (Gdk.KEY_s, Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK): _g_async_run_cb(
+                self._action_save_as),
+            (Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_open),
+            (Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK): self._action_print,
+            (Gdk.KEY_e, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_export)
+        }
+        window.connect('key-release-event', self._on_key_released)
 
         self._save_location = None
         self._save_running = BooleanLock(False)
@@ -164,14 +159,17 @@ class ExcalidrawWindow:
         self.webview = webview
         self.window = window
 
+    def _on_key_released(self, _, event: Gdk.EventKey):
+        action = self._KEYBINDINGS.get((event.keyval, event.state))
+        if action is not None:
+            action()
+
     def _on_receive_save_data(self, _, response: WebKit2.JavascriptResult):
         result_json = json.loads(response.get_js_value().to_json(0))
         data = result_json['data']
         nonce = result_json['nonce']
         self._get_save_data_cbs.pop(nonce)(data)
 
-    # FIXME: export dialog
-    # FIXME: debounce
     async def get_save_data(self, save_format: ExcalidrawSaveFormat, for_export: bool = False):
         def cb(resolve):
             # This hack is necessary because unlike in Apple's WebKit, there is no way to run an async javascript
