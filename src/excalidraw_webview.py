@@ -127,7 +127,10 @@ class ExcalidrawWindow:
         window.set_gravity(Gdk.Gravity.CENTER)
         window.set_default_size(800, 600)
 
-        webview = WebKit2.WebView()
+        webview_settings = WebKit2.Settings()
+        webview_settings.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.ALWAYS)
+        # noinspection PyArgumentList
+        webview = WebKit2.WebView.new_with_settings(webview_settings)
         webview.load_uri("file://" + rsc_path("dist/index.html"))
         manager: WebKit2.UserContentManager = webview.get_user_content_manager()
         manager.register_script_message_handler('getSaveData')
