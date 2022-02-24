@@ -124,8 +124,8 @@ class ExcalidrawWindow:
     def __init__(self, open_initially: Optional[str] = None, close_on_save: bool = False):
         window = Gtk.Window()
         window.connect('destroy', Gtk.main_quit)
-        window.set_gravity(Gdk.Gravity.CENTER)
         window.set_default_size(800, 600)
+        window.fullscreen()
 
         webview_settings = WebKit2.Settings()
         webview_settings.set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.ALWAYS)
@@ -147,7 +147,8 @@ class ExcalidrawWindow:
                 self._action_save_as),
             (Gdk.KEY_o, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_open),
             (Gdk.KEY_p, Gdk.ModifierType.CONTROL_MASK): self._action_print,
-            (Gdk.KEY_e, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_export)
+            (Gdk.KEY_e, Gdk.ModifierType.CONTROL_MASK): _g_async_run_cb(self._action_export),
+            (Gdk.KEY_Escape, Gdk.ModifierType(0)): self._toggle_fullscreen
         }
         window.connect('key-release-event', self._on_key_released)
 
@@ -325,6 +326,10 @@ class ExcalidrawWindow:
             await g_async(file).replace_contents_bytes_async(GLib.Bytes.new(content), None, False,
                                                              Gio.FileCreateFlags.NONE)
         chooser.destroy()
+
+    def _toggle_fullscreen(self, *_):
+        fullscreen = self.window.get_window().get_state() & (Gdk.WindowState.FULLSCREEN | Gdk.WindowState.MAXIMIZED)
+        self.window.unfullscreen() if fullscreen else self.window.fullscreen()
 
     def show(self):
         self.window.show()
